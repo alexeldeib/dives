@@ -137,8 +137,57 @@ and first boot configuration. It has multiple [stages][cloud init stages], each 
 
 Let's bring this back to Azure and Kubernetes.
 
-TODO(ace): bring it back
+In the [status quo](../node/status_quo.md) doc, we summarized the high level process of node provisioning.
+Now we can return to that in a bit more depth.
 
+Each nodepool in each of the thousands of AKS clusters may require slightly different configuration.
+Some configuration details are per-nodepool, some are per-cluster, some per Kubernetes version, etc.
+
+AKS has a few tools to customize nodes:
+- We build custom VM images. Since we don't know specific details, there are limits to what we can do here.
+  - We can build VM images for specific scenarios to optimize e.g. latency, but this comes with maintenance cost and COGS.
+- We can use cloud init for first boot customization of Linux nodes. This can consume cluster-specific data.
+  - Cloud init (the agent) consumes configuration from a disk/file mounted to the VM by the Azure platform.
+  - We can also read this file directly. It used to be possible to retrieve customData via IMDS but this was disabled for security reasons.
+- We can use Azure VM extensions to configure node. Notably, the custom script extension (CSE) can deliver arbitrary bash payloads. This can also consume cluster-specific data.
+- We can use userData and retrieve the data via IMDS (yes, I just said this was disabled, but it's back!).
+
+We use custom VM images, cloud init, and CSE today.
+
+### How does this impact latency?
+
+Our VM images cache binaries and images for many Kubernetes versions,
+but we do not know cluster details like Kubernetes version until runtime.
+Today we rely on CSE to configure and start Kubelet. CSE itself depends on 
+waagent. Waagent depends on several early cloud-init stages. If we knew
+which version of kubelet we needed, we could start it as a systemd unit in
+the VM image. This would likely take a dependency on network-online.target
+(for connectivity to API server), but would remove any cloud init, CSE, or 
+waagent dependency. In this particular case we depend on cloud-final,
+which above adds 11 seconds of latency. network-online also precedes
+cloud-config, removing another 3 seconds.
+
+### Summary and Goals
+
+To recap:
+- We want to provision Kubernetes nodes as fast as possible for a good user experience.
+- We have some data we can't possibly know until the user creates a cluster.
+- We want to get that data onto a VM and process it as quickly as possible, so we can finish provisioning.
+
+Today, we do a lot of things with cloud init and CSE.
+Some of these are truly necessary. Some are not.
+
+To meet the goals above:
+- We should do as much as possible in the VM image, like starting the correct version of Kubelet.
+- We should deliver runtime configuration using either customData directly from disk or userData.
+  - We already depend on cloud init to process customData, so I suggest using userData via IMDS.
+  - Additionally, userData may be changed on a live VM in VMSS without reimage, and queried via IMDS for updates.
+  - This facilitates in-place update, but we need a signalling mechanism (or else we need to resort to polling).
+
+In practice this means refactoring many of our scripts, moving things we do unnecessarily
+at runtime into the VM image, and building more VM images to optimize more scenarios.
+
+The in-place update point is also key. More on that later...
 
 [0]: https://github.com/0xAX/linux-insides
 [1]: https://github.com/0xAX/linux-insides/blob/master/Initialization/linux-initialization-10.md#first-steps-after-the-start_kernel
